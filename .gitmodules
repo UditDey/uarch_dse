@@ -1,9 +1,9 @@
 [submodule "third_party/gem5"]
 	path = third_party/gem5
 	url = https://github.com/gem5/gem5.git
-[submodule "third_party/mcpat-calib-public"]
-	path = third_party/mcpat-calib-public
-	url = https://github.com/zhaijw18/mcpat-calib-public.git
 [submodule "third_party/sqlite-amalgamation"]
 	path = third_party/sqlite-amalgamation
 	url = https://github.com/azadkuh/sqlite-amalgamation.git
+[submodule "third_party/mcpat"]
+	path = third_party/mcpat
+	url = https://github.com/HewlettPackard/mcpat
