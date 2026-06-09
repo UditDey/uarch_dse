@@ -73,18 +73,18 @@ def fix_widths(X):
 
 
 class DSEProblem(Problem):
-    def __init__(self, ipc_model, energy_model):
+    def __init__(self, ipc_model, power_model):
         xl = np.array([min(v) for v in PARAM_VALUES], dtype=float)
         xu = np.array([max(v) for v in PARAM_VALUES], dtype=float)
         super().__init__(n_var=len(PARAM_NAMES), n_obj=2, xl=xl, xu=xu)
         self.ipc_model = ipc_model
-        self.energy_model = energy_model
+        self.power_model = power_model
 
     def _evaluate(self, X, out, *args, **kwargs):
         X_d = fix_widths(snap(X))
         ipc = self.ipc_model.predict(X_d)
-        energy = self.energy_model.predict(X_d)
-        out["F"] = np.column_stack([-ipc, energy])  # minimize -IPC, minimize energy
+        power = self.power_model.predict(X_d)
+        out["F"] = np.column_stack([-ipc, power])  # minimize -IPC, minimize power
 
 
 def label(val, name):
@@ -105,14 +105,14 @@ def main():
     # Load models
     ipc_model = xgb.XGBRegressor()
     ipc_model.load_model(f"{args.model_dir}/ipc.json")
-    energy_model = xgb.XGBRegressor()
-    energy_model.load_model(f"{args.model_dir}/energy.json")
+    power_model = xgb.XGBRegressor()
+    power_model.load_model(f"{args.model_dir}/power.json")
     print("Loaded models\n")
 
     # Optimize
     print(f"Running NSGA-II: pop={args.pop_size} gen={args.n_gen}")
     result = minimize(
-        DSEProblem(ipc_model, energy_model),
+        DSEProblem(ipc_model, power_model),
         NSGA2(pop_size=args.pop_size, sampling=FloatRandomSampling(),
               crossover=SBX(prob=0.9, eta=15), mutation=PM(eta=20),
               eliminate_duplicates=True),
@@ -140,13 +140,13 @@ def main():
 
     # Print
     print(f"\nPareto front: {len(X_opt)} configs\n")
-    print(f"{'#':>3s} {'IPC':>7s} {'Energy':>14s}   "
+    print(f"{'#':>3s} {'IPC':>7s} {'Power (W)':>14s}   "
           f"{'width':>5s} {'ROB':>4s} {'L1I':>5s} {'L1D':>5s} {'L2':>6s} {'BP':>12s}")
     print("-" * 80)
 
     for i in range(len(X_opt)):
         c = X_opt[i]
-        print(f"{i+1:3d} {-F[i,0]:7.4f} {F[i,1]:14.0f}   "
+        print(f"{i+1:3d} {-F[i,0]:7.4f} {F[i,1]:14.4f}   "
               f"{int(c[2]):5d} {int(c[5]):4d} "
               f"{label(c[8], 'l1i_size'):>5s} {label(c[9], 'l1d_size'):>5s} "
               f"{label(c[12], 'l2_size'):>6s} {label(c[14], 'bp_type'):>12s}")
@@ -157,7 +157,7 @@ def main():
     for i in range(len(X_opt)):
         row = {PARAM_NAMES[j]: int(X_opt[i, j]) for j in range(len(PARAM_NAMES))}
         row["pred_ipc"] = round(-F[i, 0], 4)
-        row["pred_energy"] = round(F[i, 1], 0)
+        row["pred_power"] = round(F[i, 1], 4)
         rows.append(row)
     df = pd.DataFrame(rows)
     out_path = f"{args.model_dir}/pareto_front.csv"

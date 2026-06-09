@@ -126,12 +126,13 @@ def S(stats, *names, default=0):
     return int(default)
 
 
-def compute_energy_proxy(stats, config):
+def compute_energy_proxy(stats, config, clock_mhz=2000):
     """
-    Estimate total energy (in picojoules) from gem5 stats + config.
+    Estimate power (in Watts) from gem5 stats + config.
 
     Energy model based on Horowitz ISSCC 2014 ("Computing's Energy Problem"),
-    measured at 45nm 0.9V. All coefficients in picojoules (pJ).
+    measured at 45nm 0.9V. Activity coefficients in picojoules (pJ).
+    Power conversion: 1 pJ / 1 ps = 1 W.
 
     ┌─────────────────────────────────────────────────────────────────────┐
     │ MEASURED by Horowitz (45nm 0.9V):                                  │
@@ -165,6 +166,9 @@ def compute_energy_proxy(stats, config):
     """
 
     import math
+
+    # Cycle time in picoseconds: 2GHz (2000 MHz) → 500 ps
+    cycle_time_ps = 1e6 / clock_mhz
 
     # ── Helper: cache access energy from size ────────────────────────
     # Horowitz anchors: 8kB → 10 pJ, 1MB → 100 pJ
@@ -297,16 +301,20 @@ def compute_energy_proxy(stats, config):
     ) * cycles
 
     # ── TOTAL ────────────────────────────────────────────────────────
-    energy = E_exec + E_regfile + E_pipeline + E_l1 + E_l2 + E_dram + E_structural
+    energy_pJ = E_exec + E_regfile + E_pipeline + E_l1 + E_l2 + E_dram + E_structural
 
     ipc = committed / cycles if cycles > 0 else 0
-    epi = energy / committed if committed > 0 else 0
+    epi = energy_pJ / committed if committed > 0 else 0
 
-    return energy, ipc, epi
+    # Power in Watts: 1 pJ / 1 ps = 1 W
+    # gem5 tick = 1 ps, so clock period in ps = config clock value
+    power_W = energy_pJ / (cycles * cycle_time_ps) if cycles > 0 else 0
+
+    return power_W, ipc, epi
 
 
 def run_single(args_tuple):
-    """Run a single gem5 simulation. Returns (config_dict, stats_dict, energy, ipc, epi)."""
+    """Run a single gem5 simulation. Returns (config_dict, power_W, ipc, epi)."""
     idx, config, gem5_bin, gem5_config, binary, binary_args, results_dir = args_tuple
 
     outdir = os.path.join(results_dir, f"run_{idx:04d}")
@@ -335,17 +343,17 @@ def run_single(args_tuple):
         return idx, config, None, None, None
 
     stats = parse_stats(stats_path)
-    energy, ipc, epi = compute_energy_proxy(stats, config)
+    power, ipc, epi = compute_energy_proxy(stats, config)
 
-    if energy is None:
+    if power is None:
         print(f"  [BAD STATS] run_{idx:04d}")
         return idx, config, None, None, None
 
-    print(f"  run_{idx:04d}: IPC={ipc:.3f}  energy={energy:.0f}  EPI={epi:.1f}  "
+    print(f"  run_{idx:04d}: IPC={ipc:.3f}  power={power:.3f}W  EPI={epi:.1f}  "
           f"w={config['issue_width']} ROB={config['rob_entries']} "
           f"L1D={config['l1d_size']} L2={config['l2_size']} BP={config['bp_type']}")
 
-    return idx, config, energy, ipc, epi
+    return idx, config, power, ipc, epi
 
 
 def main():
@@ -407,17 +415,17 @@ def main():
     results.sort(key=lambda x: x[0])
 
     # Write CSV
-    fieldnames = list(DESIGN_SPACE.keys()) + ["energy", "ipc", "epi"]
+    fieldnames = list(DESIGN_SPACE.keys()) + ["power", "ipc", "epi"]
     successful = 0
 
     with open(args.output, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
-        for idx, config, energy, ipc, epi in results:
-            if energy is not None:
+        for idx, config, power, ipc, epi in results:
+            if power is not None:
                 row = dict(config)
-                row["energy"] = energy
+                row["power"] = round(power, 6)
                 row["ipc"] = round(ipc, 6)
                 row["epi"] = round(epi, 2)
                 writer.writerow(row)

@@ -21,7 +21,7 @@ PARAM_COLS = [
     "l2_size", "l2_assoc", "bp_type",
 ]
 
-TARGETS = ["ipc", "energy"]
+TARGETS = ["ipc", "power"]
 
 
 def encode(df):
