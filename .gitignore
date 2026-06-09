@@ -1,3 +1,6 @@
 env
 m5out
 sqlite_bench
+results
+models
+*.csv
