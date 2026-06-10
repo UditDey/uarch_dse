@@ -2,6 +2,13 @@
 """
 dse_optimize.py — Find Pareto-optimal configs using saved XGBoost surrogates.
 
+Uses pymoo's mixed-variable support so every parameter is a proper
+discrete Choice — no continuous relaxation, no snap-to-grid bias.
+
+Width constraints (fetch >= decode >= dispatch >= issue, commit >= issue)
+are enforced inside the evaluator so the surrogate always sees valid
+configs, and again when extracting the Pareto front for output.
+
 Usage:
     python3 dse_optimize.py
     python3 dse_optimize.py --model-dir models/ --n-gen 300
@@ -9,91 +16,128 @@ Usage:
 
 import argparse
 import numpy as np
+import pandas as pd
 import xgboost as xgb
-from pymoo.core.problem import Problem
-from pymoo.algorithms.moo.nsga2 import NSGA2
-from pymoo.operators.crossover.sbx import SBX
-from pymoo.operators.mutation.pm import PM
-from pymoo.operators.sampling.rnd import FloatRandomSampling
+
+from pymoo.core.problem import ElementwiseProblem
+from pymoo.core.variable import Choice
+from pymoo.core.mixed import MixedVariableGA
+from pymoo.algorithms.moo.nsga2 import RankAndCrowdingSurvival
 from pymoo.optimize import minimize
 from pymoo.termination import get_termination
 
-# ── Design space ─────────────────────────────────────────────────────
 
+# ── Design space (matches dse_collect.py & train_surrogate.py) ───────
+#
+# Every parameter is a discrete Choice.  Sizes and bp_type are stored
+# in the surrogate's encoded form (bytes / int label) so we can feed
+# the model directly without a separate encode step.
+
+SIZE_MAP = {16384: "16kB", 32768: "32kB", 65536: "64kB",
+            131072: "128kB", 262144: "256kB", 524288: "512kB",
+            1048576: "1MB"}
+BP_MAP = {0: "LocalBP", 1: "BiModeBP", 2: "TournamentBP", 3: "TAGE"}
+
+# Ordered list — the surrogate expects features in exactly this order.
 PARAM_NAMES = [
-    "fetch_width", "decode_width", "issue_width", "commit_width", "dispatch_width",
-    "rob_entries", "lq_entries", "sq_entries",
+    "fetch_width", "decode_width", "issue_width", "commit_width",
+    "dispatch_width", "rob_entries", "lq_entries", "sq_entries",
     "l1i_size", "l1d_size", "l1i_assoc", "l1d_assoc",
     "l2_size", "l2_assoc", "bp_type",
 ]
 
-PARAM_VALUES = [
-    [2, 4, 8],           # fetch_width
-    [2, 4, 8],           # decode_width
-    [2, 4, 8],           # issue_width
-    [2, 4, 8],           # commit_width
-    [2, 4, 8],           # dispatch_width
-    [32, 64, 128, 192, 256],  # rob_entries
-    [16, 32, 64],        # lq_entries
-    [16, 32, 64],        # sq_entries
-    [16384, 32768, 65536],     # l1i_size
-    [16384, 32768, 65536],     # l1d_size
-    [2, 4],              # l1i_assoc
-    [2, 4],              # l1d_assoc
-    [131072, 262144, 524288, 1048576],  # l2_size
-    [4, 8, 16],          # l2_assoc
-    [0, 1, 2, 3],        # bp_type
-]
-
-SIZE_LABELS = {16384: "16kB", 32768: "32kB", 65536: "64kB",
-               131072: "128kB", 262144: "256kB", 524288: "512kB", 1048576: "1MB"}
-BP_LABELS = {0: "LocalBP", 1: "BiModeBP", 2: "TournamentBP", 3: "TAGE"}
+PARAM_OPTIONS = {
+    "fetch_width":    [2, 4, 8],
+    "decode_width":   [2, 4, 8],
+    "issue_width":    [2, 4, 8],
+    "commit_width":   [2, 4, 8],
+    "dispatch_width": [2, 4, 8],
+    "rob_entries":    [32, 64, 128, 192, 256],
+    "lq_entries":     [16, 32, 64],
+    "sq_entries":     [16, 32, 64],
+    "l1i_size":       [16384, 32768, 65536],
+    "l1d_size":       [16384, 32768, 65536],
+    "l1i_assoc":      [2, 4],
+    "l1d_assoc":      [2, 4],
+    "l2_size":        [131072, 262144, 524288, 1048576],
+    "l2_assoc":       [4, 8, 16],
+    "bp_type":        [0, 1, 2, 3],
+}
 
 
-def snap(X):
-    """Snap continuous values to nearest discrete values."""
-    out = np.zeros_like(X)
-    for j, vals in enumerate(PARAM_VALUES):
-        arr = np.array(vals)
-        for i in range(X.shape[0]):
-            out[i, j] = arr[np.argmin(np.abs(arr - X[i, j]))]
-    return out
+# ── Width constraint helpers ─────────────────────────────────────────
+
+def _snap(value, options):
+    """Return the closest value in `options`."""
+    arr = np.array(options)
+    return options[int(np.argmin(np.abs(arr - value)))]
 
 
-def fix_widths(X):
-    """Enforce fetch >= decode >= dispatch >= issue, commit >= issue."""
-    for i in range(X.shape[0]):
-        w = sorted([X[i, 0], X[i, 1], X[i, 4], X[i, 2], X[i, 3]], reverse=True)
-        X[i, 0] = w[0]  # fetch
-        X[i, 1] = w[1]  # decode
-        X[i, 4] = w[2]  # dispatch
-        X[i, 2] = w[3]  # issue
-        X[i, 3] = max(w[4], X[i, 2])  # commit >= issue
-    return X
+def fix_widths(xd):
+    """
+    Enforce fetch >= decode >= dispatch >= issue, commit >= issue.
+
+    Sorts the five width values descending and snaps each back to
+    a legal Choice value.  Operates on a dict in-place and returns it.
+    """
+    widths = sorted(
+        [xd["fetch_width"], xd["decode_width"], xd["dispatch_width"],
+         xd["issue_width"], xd["commit_width"]],
+        reverse=True,
+    )
+    xd["fetch_width"]    = _snap(widths[0], PARAM_OPTIONS["fetch_width"])
+    xd["decode_width"]   = _snap(widths[1], PARAM_OPTIONS["decode_width"])
+    xd["dispatch_width"] = _snap(widths[2], PARAM_OPTIONS["dispatch_width"])
+    xd["issue_width"]    = _snap(widths[3], PARAM_OPTIONS["issue_width"])
+    xd["commit_width"]   = _snap(
+        max(widths[4], xd["issue_width"]),
+        PARAM_OPTIONS["commit_width"],
+    )
+    return xd
 
 
-class DSEProblem(Problem):
-    def __init__(self, ipc_model, power_model):
-        xl = np.array([min(v) for v in PARAM_VALUES], dtype=float)
-        xu = np.array([max(v) for v in PARAM_VALUES], dtype=float)
-        super().__init__(n_var=len(PARAM_NAMES), n_obj=2, xl=xl, xu=xu)
+# ── Problem definition ───────────────────────────────────────────────
+
+class DSEProblem(ElementwiseProblem):
+    """
+    Bi-objective: maximise IPC (minimise −IPC), minimise power.
+
+    Each variable is a Choice over its legal discrete values.
+    Width constraints are enforced before querying the surrogate
+    so the model always sees physically valid configurations.
+    """
+
+    def __init__(self, ipc_model, power_model, **kwargs):
+        variables = {
+            name: Choice(options=opts)
+            for name, opts in PARAM_OPTIONS.items()
+        }
+        super().__init__(vars=variables, n_obj=2, **kwargs)
         self.ipc_model = ipc_model
         self.power_model = power_model
 
     def _evaluate(self, X, out, *args, **kwargs):
-        X_d = fix_widths(snap(X))
-        ipc = self.ipc_model.predict(X_d)
-        power = self.power_model.predict(X_d)
-        out["F"] = np.column_stack([-ipc, power])  # minimize -IPC, minimize power
+        # Fix widths before querying surrogate.
+        xd = fix_widths(dict(X))
 
+        # Build feature vector in the order the surrogate expects.
+        x = np.array([[xd[p] for p in PARAM_NAMES]], dtype=float)
+        ipc = float(self.ipc_model.predict(x)[0])
+        power = float(self.power_model.predict(x)[0])
+        out["F"] = [-ipc, power]
+
+
+# ── Pretty-printing helpers ──────────────────────────────────────────
 
 def label(val, name):
     if name in ("l1i_size", "l1d_size", "l2_size"):
-        return SIZE_LABELS.get(int(val), str(int(val)))
+        return SIZE_MAP.get(int(val), str(int(val)))
     if name == "bp_type":
-        return BP_LABELS.get(int(val), str(int(val)))
+        return BP_MAP.get(int(val), str(int(val)))
     return str(int(val))
 
+
+# ── Main ─────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser()
@@ -102,63 +146,101 @@ def main():
     ap.add_argument("--pop-size", type=int, default=100)
     args = ap.parse_args()
 
-    # Load models
+    # Load surrogate models
     ipc_model = xgb.XGBRegressor()
     ipc_model.load_model(f"{args.model_dir}/ipc.json")
     power_model = xgb.XGBRegressor()
     power_model.load_model(f"{args.model_dir}/power.json")
-    print("Loaded models\n")
+    print("Loaded surrogate models\n")
 
-    # Optimize
-    print(f"Running NSGA-II: pop={args.pop_size} gen={args.n_gen}")
-    result = minimize(
-        DSEProblem(ipc_model, power_model),
-        NSGA2(pop_size=args.pop_size, sampling=FloatRandomSampling(),
-              crossover=SBX(prob=0.9, eta=15), mutation=PM(eta=20),
-              eliminate_duplicates=True),
-        termination=get_termination("n_gen", args.n_gen),
-        seed=42, verbose=False,
+    problem = DSEProblem(ipc_model, power_model)
+
+    # MixedVariableGA with NSGA-II survival for multi-objective.
+    # Default MixedVariableDuplicateElimination handles dict-based
+    # individuals correctly.
+    algorithm = MixedVariableGA(
+        pop_size=args.pop_size,
+        survival=RankAndCrowdingSurvival(),
     )
 
-    # Extract and clean Pareto front
-    X_opt = fix_widths(snap(result.X))
-    F = result.F
+    print(f"Running NSGA-II (mixed-variable): "
+          f"pop={args.pop_size}  gen={args.n_gen}")
+    result = minimize(
+        problem,
+        algorithm,
+        termination=get_termination("n_gen", args.n_gen),
+        seed=42,
+        verbose=False,
+    )
 
-    # Deduplicate
+    # ── Extract Pareto front ─────────────────────────────────────────
+    F = result.F                  # (n_solutions, 2): [-ipc, power]
+    X_raw = result.X              # list of dicts (mixed-variable output)
+
+    # Apply width fix to output (evaluator fixed a copy; result.X is raw)
+    X_dicts = [fix_widths(dict(xd)) for xd in X_raw]
+
+    # Deduplicate (fixed widths may collapse distinct raw configs)
     seen = set()
     keep = []
-    for i in range(len(X_opt)):
-        key = tuple(X_opt[i].astype(int))
+    for i, xd in enumerate(X_dicts):
+        key = tuple(xd[p] for p in PARAM_NAMES)
         if key not in seen:
             seen.add(key)
             keep.append(i)
-    X_opt, F = X_opt[keep], F[keep]
+    X_dicts = [X_dicts[i] for i in keep]
+    F = F[keep]
 
-    # Sort by IPC descending
+    # Sort by IPC descending (F[:,0] is -IPC, so ascending sort)
     order = np.argsort(F[:, 0])
-    X_opt, F = X_opt[order], F[order]
+    X_dicts = [X_dicts[i] for i in order]
+    F = F[order]
 
-    # Print
-    print(f"\nPareto front: {len(X_opt)} configs\n")
-    print(f"{'#':>3s} {'IPC':>7s} {'Power (W)':>14s}   "
-          f"{'width':>5s} {'ROB':>4s} {'L1I':>5s} {'L1D':>5s} {'L2':>6s} {'BP':>12s}")
-    print("-" * 80)
+    # ── Print ────────────────────────────────────────────────────────
+    print(f"\nPareto front: {len(X_dicts)} configs\n")
+    header = (f"{'#':>3s} {'IPC':>7s} {'Power(W)':>10s}   "
+              f"{'fw':>3s} {'dw':>3s} {'dpw':>3s} {'iw':>3s} {'cw':>3s} "
+              f"{'ROB':>4s} {'LQ':>3s} {'SQ':>3s} "
+              f"{'L1I':>5s} {'L1D':>5s} {'L1Ia':>4s} {'L1Da':>4s} "
+              f"{'L2':>6s} {'L2a':>3s} {'BP':>12s}")
+    print(header)
+    print("-" * len(header))
 
-    for i in range(len(X_opt)):
-        c = X_opt[i]
-        print(f"{i+1:3d} {-F[i,0]:7.4f} {F[i,1]:14.4f}   "
-              f"{int(c[2]):5d} {int(c[5]):4d} "
-              f"{label(c[8], 'l1i_size'):>5s} {label(c[9], 'l1d_size'):>5s} "
-              f"{label(c[12], 'l2_size'):>6s} {label(c[14], 'bp_type'):>12s}")
+    for i, xd in enumerate(X_dicts):
+        ipc = -F[i, 0]
+        power = F[i, 1]
+        print(
+            f"{i+1:3d} {ipc:7.4f} {power:10.4f}   "
+            f"{int(xd['fetch_width']):3d} {int(xd['decode_width']):3d} "
+            f"{int(xd['dispatch_width']):3d} {int(xd['issue_width']):3d} "
+            f"{int(xd['commit_width']):3d} "
+            f"{int(xd['rob_entries']):4d} "
+            f"{int(xd['lq_entries']):3d} {int(xd['sq_entries']):3d} "
+            f"{label(xd['l1i_size'], 'l1i_size'):>5s} "
+            f"{label(xd['l1d_size'], 'l1d_size'):>5s} "
+            f"{int(xd['l1i_assoc']):4d} {int(xd['l1d_assoc']):4d} "
+            f"{label(xd['l2_size'], 'l2_size'):>6s} "
+            f"{int(xd['l2_assoc']):3d} "
+            f"{label(xd['bp_type'], 'bp_type'):>12s}"
+        )
 
-    # Also save as CSV
-    import pandas as pd
+    # ── Save CSV ─────────────────────────────────────────────────────
     rows = []
-    for i in range(len(X_opt)):
-        row = {PARAM_NAMES[j]: int(X_opt[i, j]) for j in range(len(PARAM_NAMES))}
+    for i, xd in enumerate(X_dicts):
+        row = {}
+        for p in PARAM_NAMES:
+            v = xd[p]
+            # Decode to human-readable for the CSV
+            if p in ("l1i_size", "l1d_size", "l2_size"):
+                row[p] = SIZE_MAP.get(int(v), str(int(v)))
+            elif p == "bp_type":
+                row[p] = BP_MAP.get(int(v), str(int(v)))
+            else:
+                row[p] = int(v)
         row["pred_ipc"] = round(-F[i, 0], 4)
         row["pred_power"] = round(F[i, 1], 4)
         rows.append(row)
+
     df = pd.DataFrame(rows)
     out_path = f"{args.model_dir}/pareto_front.csv"
     df.to_csv(out_path, index=False)

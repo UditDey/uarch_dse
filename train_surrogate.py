@@ -93,10 +93,13 @@ def main():
         print(f"  MAE:  {mae:.4f}")
         print(f"  MAPE: {mape:.2f}%")
 
-        # Feature importance
+        # Feature importance (all params, sorted by importance)
         imp = model.feature_importances_
-        top = np.argsort(imp)[-5:][::-1]
-        print(f"  Top features: {', '.join(f'{PARAM_COLS[i]}={imp[i]:.3f}' for i in top)}")
+        order = np.argsort(imp)[::-1]
+        print(f"  Feature sensitivities (descending):")
+        for i in order:
+            bar = "█" * int(imp[i] / imp[order[0]] * 20)  # normalize to top feature
+            print(f"    {PARAM_COLS[i]:<18s} {imp[i]:.4f}  {bar}")
 
         # Worst predictions
         errors = np.abs(y_test - y_pred)

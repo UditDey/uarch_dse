@@ -349,9 +349,8 @@ def run_single(args_tuple):
         print(f"  [BAD STATS] run_{idx:04d}")
         return idx, config, None, None, None
 
-    print(f"  run_{idx:04d}: IPC={ipc:.3f}  power={power:.3f}W  EPI={epi:.1f}  "
-          f"w={config['issue_width']} ROB={config['rob_entries']} "
-          f"L1D={config['l1d_size']} L2={config['l2_size']} BP={config['bp_type']}")
+    params = "  ".join(f"{k}={config[k]}" for k in DESIGN_SPACE)
+    print(f"  run_{idx:04d}: IPC={ipc:.3f}  power={power:.3f}W  EPI={epi:.1f}  {params}")
 
     return idx, config, power, ipc, epi
 
