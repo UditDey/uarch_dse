@@ -37,7 +37,7 @@ TODO: Explain
 Run these inside the `venv`
 ```bash
 # Collect gem5 simulation run data
-python dataset_collect.py --n-samples 300 --parallel 11 --gem5-bin third_party/gem5/build/RISCV/gem5.opt --gem5-config gem5_config.py --binary sqlite_bench --binary-args "80"
+python dataset_collect.py --n-samples 300 --parallel $(nproc) --gem5-bin third_party/gem5/build/RISCV/gem5.opt --gem5-config gem5_config.py --binary sqlite_bench --binary-args "80"
 
 # Train surrogate XGBoost models
 python train_surrogate.py dse_data.csv --model-dir models/
